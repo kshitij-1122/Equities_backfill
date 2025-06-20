@@ -36,7 +36,7 @@ def connect_market_data():
 def get_combined_ticker_universe():
     # 1. Get yesterday's tickers from applications DB
     engine = connect_back_office_applications()
-    valuation_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    valuation_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     query = f"""
         SELECT DISTINCT bloomberg_ticker
         FROM position.aggregated_valuations
@@ -55,7 +55,9 @@ def get_combined_ticker_universe():
         df_existing = pd.DataFrame(columns=["TICKER"])
     conn.close()
 
-    df_all = pd.concat([df_new, df_existing.rename(columns={"TICKER": "ticker"})], ignore_index=True).drop_duplicates()
+    df_all = pd.concat(
+        [df_new, df_existing.rename(columns={"TICKER": "ticker"})], ignore_index=True
+    ).drop_duplicates()
     return df_all["ticker"].tolist()
 
 
@@ -63,8 +65,9 @@ def get_combined_ticker_universe():
 def get_existing_date_ranges():
     engine = connect_market_data()
     query = """
-        SELECT identifier, MIN(date) AS min_date, MAX(date) AS max_date
+        SELECT distinct(identifier), MIN(date) AS min_date, MAX(date) AS max_date
         FROM raw.bbg_values
+        where identifier like '%Equity'
         GROUP BY identifier
     """
     df = pd.read_sql(query, engine, parse_dates=["min_date", "max_date"])
@@ -76,45 +79,44 @@ def backfill_missing_data():
     tickers = get_combined_ticker_universe()
     existing_ranges = get_existing_date_ranges()
 
-    tickers_to_backfill = []
+    tickers_to_backfill = {}
 
     for ticker in tickers:
         if ticker not in existing_ranges:
-            tickers_to_backfill.append((ticker, START_DATE, END_DATE))
+            tickers_to_backfill[ticker] = {"start": START_DATE, "end": END_DATE}
         else:
             min_date = existing_ranges[ticker]["min_date"].date()
             max_date = existing_ranges[ticker]["max_date"].date()
 
-            if min_date > START_DATE.date():
-                tickers_to_backfill.append((ticker, START_DATE, min_date - timedelta(days=1)))
+            if min_date > START_DATE.date() and max_date < END_DATE.date():
+                tickers_to_backfill[ticker] = {
+                    "start": START_DATE,
+                    "min_date": min_date - timedelta(days=1),
+                }
             if max_date < END_DATE.date():
-                tickers_to_backfill.append((ticker, max_date + timedelta(days=1), END_DATE))
+                tickers_to_backfill[ticker] = {
+                    "max_date": max_date + timedelta(days=1),
+                    "end": END_DATE,
+                }
 
-    if not tickers_to_backfill:
-        print("✅ All tickers are fully backfilled in raw.bbg_values.")
-        return
-
-    request_id = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz123456789", k=12))
+    request_id = "".join(random.choices("abcdefghijklmnopqrstuvwxyz123456789", k=12))
     universe = [
-        {
-            "@type": "Identifier",
-            "identifierType": "TICKER",
-            "identifierValue": ticker
-        }
-        for ticker, _, _ in tickers_to_backfill
+        {"@type": "Identifier", "identifierType": "TICKER", "identifierValue": ticker}
+        for ticker in tickers_to_backfill.keys()
     ]
 
-    global_start = min(pd.to_datetime(start) for _, start, _ in tickers_to_backfill)
-    global_end = max(pd.to_datetime(end) for _, _, end in tickers_to_backfill)
+    global_start = min(
+        [x["max_date"] for x in tickers_to_backfill.values() if "max_date" in x]
+    )
+    global_end = max(
+        x["min_date"] for x in tickers_to_backfill.values() if "min_date" in x
+    )
 
     req = {
         "@type": "HistoryRequest",
         "name": request_id,
         "description": f"Backfill for {len(set(t[0] for t in tickers_to_backfill))} tickers",
-        "universe": {
-            "@type": "Universe",
-            "contains": universe
-        },
+        "universe": {"@type": "Universe", "contains": universe},
         "trigger": {"@type": "SubmitTrigger"},
         "formatting": {"@type": "MediaType", "outputMediaType": "text/csv"},
         "runtimeOptions": {
@@ -122,8 +124,8 @@ def backfill_missing_data():
             "dateRange": {
                 "@type": "IntervalDateRange",
                 "startDate": global_start.strftime("%Y-%m-%d"),
-                "endDate": global_end.strftime("%Y-%m-%d")
-            }
+                "endDate": global_end.strftime("%Y-%m-%d"),
+            },
         },
         "fieldList": {
             "@type": "HistoryFieldList",
@@ -133,16 +135,18 @@ def backfill_missing_data():
                 {"mnemonic": "PX_VOLUME"},
                 {"mnemonic": "SECURITY_TYP"},
                 {"mnemonic": "TICKER"},
-            ]
-        }
+            ],
+        },
     }
 
     df = download(req)
     if df is not None and not df.empty:
         conn = sqlite3.connect(SQLITE_PATH)
-        df.to_sql(TABLE_NAME, conn, if_exists='append', index=False)
+        df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
         conn.close()
-        print(f"✅ Backfilled {len(df)} rows for {len(set(t[0] for t in tickers_to_backfill))} tickers.")
+        print(
+            f"✅ Backfilled {len(df)} rows for {len(set(t[0] for t in tickers_to_backfill))} tickers."
+        )
     else:
         print("⚠️ No data returned from Bloomberg.")
 
